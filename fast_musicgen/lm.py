@@ -9,7 +9,7 @@ from tqdm import tqdm
 
 
 class CausalLM(nn.Module):
-    def __init__(self, config: MusicgenConfig):
+    def __init__(self, config: MusicgenConfig, device: str):
         super().__init__()
         self.config = config
         self.num_codebooks = config.decoder.num_codebooks
@@ -34,6 +34,7 @@ class CausalLM(nn.Module):
                 for _ in range(self.num_codebooks)
             ]
         )
+        self.device = device
 
     def forward(
         self,
@@ -84,15 +85,19 @@ class CausalLM(nn.Module):
         Returns:
             torch.Tensor: (1, max_steps, num_codebooks)
         """
+        text_x = text_x.to(self.device)
         # Assuming no audio prompt we start with all bos token for the codebooks
         audio_shape = (1, max_steps + 1, self.num_codebooks)
-        audio_seq = torch.full(audio_shape, self.bos_token_id)
+        audio_seq = torch.full(audio_shape, self.bos_token_id).to(self.device)
 
         # Compute conditional and unconditional logits in one batch
-        text_tokens = torch.concatenate([text_x, torch.zeros_like(text_x)], dim=0)
+        text_tokens = torch.concatenate(
+            [text_x, torch.zeros_like(text_x).to(self.device)], dim=0
+        )
         head_dim = self.hidden_size // self.num_attention_heads
         cache = [
-            KVCache(head_dim, self.num_attention_heads) for _ in range(len(self.layers))
+            KVCache(head_dim, self.num_attention_heads, self.device)
+            for _ in range(len(self.layers))
         ]
         for offset in tqdm(range(max_steps)):
             audio_input = torch.tile(audio_seq[:, offset : offset + 1], [2, 1, 1])
@@ -124,7 +129,9 @@ class CausalLM(nn.Module):
         half_dim = dim // 2
         adim = torch.arange(half_dim).reshape(1, 1, -1)
         phase = positions / (max_period ** (adim / (half_dim - 1)))
-        return torch.concatenate([torch.cos(phase), torch.sin(phase)], dim=-1)
+        return torch.concatenate([torch.cos(phase), torch.sin(phase)], dim=-1).to(
+            self.device
+        )
 
     def top_k_sampling(
         self, logits: torch.Tensor, top_k: int, temperature: float, dim: int = -2
@@ -185,7 +192,7 @@ class CausalLM(nn.Module):
                 device = "cpu"
         config = MusicgenConfig.from_pretrained(ckpt_dir)
         with torch.device("meta"):
-            model = CausalLM(config)
+            model = CausalLM(config, device=device)
         states = torch.load(Path(ckpt_dir) / "state_dict.bin", weights_only=True)[
             "best_state"
         ]
@@ -289,7 +296,8 @@ class FeedForward(nn.Module):
 
 
 class KVCache:
-    def __init__(self, head_dim, n_kv_heads, num_steps: int = 256):
+    def __init__(self, head_dim, n_kv_heads, device: str, num_steps: int = 256):
+        super().__init__()
         self.n_kv_heads = n_kv_heads
         if isinstance(head_dim, int):
             self.k_head_dim = self.v_head_dim = head_dim
@@ -301,6 +309,7 @@ class KVCache:
         self.values = None
         self.offset = 0
         self.step = num_steps
+        self.device = device
 
     def update_and_fetch(self, keys, values):
         prev = self.offset
@@ -309,8 +318,8 @@ class KVCache:
             n_steps = (self.step + keys.shape[2] - 1) // self.step
             k_shape = (B, self.n_kv_heads, n_steps * self.step, self.k_head_dim)
             v_shape = (B, self.n_kv_heads, n_steps * self.step, self.v_head_dim)
-            new_k = torch.zeros(k_shape, dtype=keys.dtype)
-            new_v = torch.zeros(v_shape, dtype=values.dtype)
+            new_k = torch.zeros(k_shape, dtype=keys.dtype, device=self.device)
+            new_v = torch.zeros(v_shape, dtype=values.dtype, device=self.device)
             if self.keys is not None:
                 if prev % self.step != 0:
                     self.keys = self.keys[..., :prev, :]
