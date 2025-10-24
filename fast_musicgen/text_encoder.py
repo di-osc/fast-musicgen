@@ -10,15 +10,14 @@ from transformers import AutoTokenizer
 
 
 class TextEncoder(nn.Module):
-    def __init__(self, t5_name, input_dim, output_dim):
+    def __init__(self, t5_name: str):
         super().__init__()
         self._t5, self.tokenizer = T5.from_pretrained(t5_name)
-        self.output_proj = nn.Linear(input_dim, output_dim)
 
-    def forward(self, text):
+    def encode(self, text: str) -> torch.Tensor:
         input_ids = self.tokenizer.encode(text)
         x = self._t5.encode(input_ids)
-        return self.output_proj(x)
+        return x
 
 
 class Tokenizer:

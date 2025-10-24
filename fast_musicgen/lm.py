@@ -9,7 +9,9 @@ from tqdm import tqdm
 
 
 class CausalLM(nn.Module):
-    def __init__(self, config: MusicgenConfig, device: str):
+    def __init__(
+        self, config: MusicgenConfig, device: str, dtype: torch.dtype = torch.float16
+    ):
         super().__init__()
         self.config = config
         self.num_codebooks = config.decoder.num_codebooks
@@ -34,7 +36,11 @@ class CausalLM(nn.Module):
                 for _ in range(self.num_codebooks)
             ]
         )
+        self.text_proj = nn.Linear(
+            config.text_encoder.d_model, self.hidden_size, bias=True
+        )
         self.device = device
+        self.dtype = dtype
 
     def forward(
         self,
@@ -54,7 +60,6 @@ class CausalLM(nn.Module):
         offset = cache[0].offset if cache[0] is not None else 0
         pos_emb = self.create_sin_embedding(offset, self.hidden_size)
         audio_x += pos_emb.to(audio_x.dtype)
-
         for layer, cache in zip(self.layers, cache):
             audio_x = layer(audio_x=audio_x, text_x=text_x, cache=cache)
 
@@ -85,7 +90,8 @@ class CausalLM(nn.Module):
         Returns:
             torch.Tensor: (1, max_steps, num_codebooks)
         """
-        text_x = text_x.to(self.device)
+        text_x = text_x.to(self.device).to(self.dtype)
+        text_x = self.text_proj(text_x)
         # Assuming no audio prompt we start with all bos token for the codebooks
         audio_shape = (1, max_steps + 1, self.num_codebooks)
         audio_seq = torch.full(audio_shape, self.bos_token_id).to(self.device)
@@ -149,10 +155,7 @@ class CausalLM(nn.Module):
     @classmethod
     def sanitize(cls, states: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         new_states = {}
-        ignore_keys = ["condition_provider"]
         for k, arr in states.items():
-            if any(key in k for key in ignore_keys):
-                continue
             if k.startswith("transformer."):
                 k = k[len("transformer.") :]
             if "emb" in k:
@@ -171,6 +174,11 @@ class CausalLM(nn.Module):
                 k = k.replace("linear1", "ffn.up_proj")
             if "linear2" in k:
                 k = k.replace("linear2", "ffn.down_proj")
+            if "condition_provider.conditioners.description.output_proj" in k:
+                k = k.replace(
+                    "condition_provider.conditioners.description.output_proj",
+                    "text_proj",
+                )
             if "in_proj_weight" in k:
                 dim = arr.shape[0] // 3
                 name = "in_proj_weight"
@@ -182,14 +190,7 @@ class CausalLM(nn.Module):
         return new_states
 
     @classmethod
-    def from_pretrained(cls, ckpt_dir: str, device: str | None = None) -> CausalLM:
-        if device is None:
-            if torch.mps.is_available():
-                device = "mps"
-            elif torch.cuda.is_available():
-                device = "cuda"
-            else:
-                device = "cpu"
+    def from_pretrained(cls, ckpt_dir: str, device: str = "cpu") -> CausalLM:
         config = MusicgenConfig.from_pretrained(ckpt_dir)
         with torch.device("meta"):
             model = CausalLM(config, device=device)
