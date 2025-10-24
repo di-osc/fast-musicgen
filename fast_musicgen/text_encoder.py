@@ -9,13 +9,15 @@ import numpy as np
 from transformers import AutoTokenizer
 
 
-class TextEncoder(nn.Module):
-    def __init__(self, t5_name: str):
+class TextEncoder:
+    def __init__(self, t5_name: str, device: str = "cpu"):
         super().__init__()
+        self.device = device
         self._t5, self.tokenizer = T5.from_pretrained(t5_name)
+        self._t5.to(self.device)
 
     def encode(self, text: str) -> torch.Tensor:
-        input_ids = self.tokenizer.encode(text)
+        input_ids = self.tokenizer.encode(text).to(self.device)
         x = self._t5.encode(input_ids)
         return x
 
@@ -99,7 +101,6 @@ def _relative_position_bucket(
     relative_buckets += torch.where(
         is_small, relative_position, relative_position_if_large
     )
-    print(relative_buckets.shape)
     return relative_buckets.to(torch.int32)
 
 
@@ -441,4 +442,4 @@ class T5(nn.Module):
         weights = cls.sanitize(weights)
         weights = {k: v.to(dtype) for k, v in weights.items()}
         model.load_state_dict(weights)
-        return model.eval(), Tokenizer(config, "t5-base")
+        return model.eval(), Tokenizer(config, path_or_repo)

@@ -11,12 +11,15 @@ class MusicGeneration:
         lm_dir: str,
         audio_decoder_dir: str = "facebook/encodec_32khz",
         text_encoder_dir: str = "t5-base",
+        device: str = "cpu",
     ) -> None:
-        self.text_encoder: TextEncoder = TextEncoder(t5_name=text_encoder_dir)
-        self.lm: CausalLM = CausalLM.from_pretrained(ckpt_dir=lm_dir)
+        self.text_encoder: TextEncoder = TextEncoder(
+            t5_name=text_encoder_dir, device=device
+        )
+        self.lm: CausalLM = CausalLM.from_pretrained(ckpt_dir=lm_dir, device=device)
         self.audio_decoder: EncodecModel = EncodecModel.from_pretrained(
             audio_decoder_dir
-        )
+        ).to(device)
 
     @torch.inference_mode()
     def generate(
