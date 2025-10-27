@@ -16,6 +16,7 @@ class TextEncoder:
         self._t5, self.tokenizer = T5.from_pretrained(t5_name)
         self._t5.to(self.device)
 
+    @torch.inference_mode()
     def encode(self, text: str) -> torch.Tensor:
         input_ids = self.tokenizer.encode(text).to(self.device)
         x = self._t5.encode(input_ids)
@@ -128,7 +129,6 @@ class RelativePositionBias(nn.Module):
             num_buckets=self.num_buckets,
             max_distance=self.max_distance,
         )
-        print("relative_position_bucket.shape", relative_position_bucket.shape)
         # shape (query_length, key_length, num_heads)
         values = self.embeddings(relative_position_bucket)
 

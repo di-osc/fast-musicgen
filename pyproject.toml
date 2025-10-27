@@ -3,10 +3,12 @@ name = "fast-musicgen"
 version = "0.1.0"
 requires-python = ">=3.10"
 dependencies = [
-    "pydantic>=2.12.3",
-    "torch>=2.8.0",
-    "tqdm>=4.67.1",
+    "torch",
+    "torchvision",
     "transformers>=4.57.1",
+    "accelerate>=1.11.0",
+    "tqdm",
+    "loguru"
 ]
 
 [[tool.uv.index]]

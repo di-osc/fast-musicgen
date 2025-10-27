@@ -2,21 +2,26 @@ from transformers import EncodecModel
 import torch
 
 from .text_encoder import TextEncoder
-from .lm import CausalLM
+from .lm import LMRunner
 
 
 class MusicGeneration:
     def __init__(
         self,
-        lm_dir: str,
-        audio_decoder_dir: str = "facebook/encodec_32khz",
-        text_encoder_dir: str = "t5-base",
-        device: str = "cpu",
+        lm_dir: str = "checkpoints/facebook/musicgen-medium",
+        audio_decoder_dir: str = "checkpoints/facebook/encodec_32khz",
+        text_encoder_dir: str = "checkpoints/t5-base",
+        cuda_graph: bool = True,
+        device: str = "cuda",
+        dtype: torch.dtype = torch.float16,
     ) -> None:
+        self.cuda_graph = cuda_graph
         self.text_encoder: TextEncoder = TextEncoder(
             t5_name=text_encoder_dir, device=device
         )
-        self.lm: CausalLM = CausalLM.from_pretrained(ckpt_dir=lm_dir, device=device)
+        self.lm: LMRunner = LMRunner(
+            checkpoint_dir=lm_dir, cuda_graph=cuda_graph, device=device
+        )
         self.audio_decoder: EncodecModel = EncodecModel.from_pretrained(
             audio_decoder_dir
         ).to(device)
@@ -31,13 +36,22 @@ class MusicGeneration:
         guidance_coef: float = 3,
     ) -> torch.Tensor:
         text_x = self.text_encoder.encode(text)
-        audio_codes = self.lm.generate(
-            text_x=text_x,
-            max_steps=max_steps,
-            temperature=temperature,
-            top_k=top_k,
-            guidance_coef=guidance_coef,
-        )
+        if self.cuda_graph:
+            audio_codes = self.lm.generate_with_cuda_graph(
+                text_x=text_x,
+                max_steps=max_steps,
+                temperature=temperature,
+                top_k=top_k,
+                guidance_coef=guidance_coef,
+            )
+        else:
+            audio_codes = self.lm.generate(
+                text_x=text_x,
+                max_steps=max_steps,
+                temperature=temperature,
+                top_k=top_k,
+                guidance_coef=guidance_coef,
+            )
         audio = (
             self.audio_decoder.decode(audio_codes=audio_codes, audio_scales=[None])
             .audio_values.detach()

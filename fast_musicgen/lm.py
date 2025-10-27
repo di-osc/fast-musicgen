@@ -8,9 +8,182 @@ from transformers import MusicgenConfig
 from tqdm import tqdm
 
 
+class LMRunner:
+    def __init__(
+        self,
+        checkpoint_dir: str,
+        prompt_max_len: int = 20,
+        cuda_graph: bool = True,
+        device: str = "cuda",
+        dtype: torch.dtype = torch.float16,
+    ) -> None:
+        super().__init__()
+        torch.set_default_device(device)
+        self.model = CausalLM.from_pretrained(checkpoint_dir, device=device)
+        self.cuda_graph = cuda_graph
+        self.prompt_max_len = prompt_max_len
+        self.warmup()
+        self.graphs = {}
+        self.graph_vars = {}
+        if self.cuda_graph:
+            self.capture_cuda_graph()
+
+    @torch.inference_mode()
+    def capture_cuda_graph(self):
+        for i in range(1, self.prompt_max_len + 1):
+            text_x = torch.zeros(
+                2, i, self.model.config.decoder.hidden_size, dtype=self.model.dtype
+            )
+            audio_x = torch.full((2, 1, 4), self.model.config.decoder.bos_token_id)
+            cache = [
+                KVCache(
+                    self.model.head_dim,
+                    self.model.num_attention_heads,
+                    self.model.device,
+                )
+                for _ in range(len(self.model.layers))
+            ]
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                output = self.model(audio_x, text_x, cache)
+            self.graphs[i] = graph
+            self.graph_vars[i] = {
+                "text_x": text_x,
+                "audio_x": audio_x,
+                "cache": cache,
+                "output": output,
+            }
+
+    @torch.inference_mode()
+    def warmup(self):
+        for i in range(self.model.prompt_max_len):
+            text_x = torch.randn(
+                2, i, self.model.config.decoder.hidden_size, dtype=self.model.dtype
+            )
+            audio_x = torch.full(
+                (2, 1, 4), self.model.config.decoder.bos_token_id, dtype=torch.long
+            )
+            cache = [
+                KVCache(
+                    self.model.head_dim,
+                    self.model.num_attention_heads,
+                    self.model.device,
+                )
+                for _ in range(len(self.model.layers))
+            ]
+            _ = self.model(audio_x, text_x, cache)
+
+    @torch.inference_mode()
+    def generate_with_cuda_graph(
+        self,
+        text_x: torch.Tensor,
+        max_steps: int = 150,
+        temperature: float = 1.0,
+        top_k: int = 250,
+        guidance_coef: float = 3.0,
+    ) -> torch.Tensor:
+        text_x = text_x.to(self.model.device).to(self.model.dtype)
+        text_x = self.model.text_proj(text_x)
+        # Compute conditional and unconditional logits in one batch
+        text_x = torch.concatenate(
+            [text_x, torch.zeros_like(text_x).to(self.model.device)], dim=0
+        )
+
+        audio_shape = (1, max_steps + 1, self.model.num_codebooks)
+        audio_seq = torch.full(audio_shape, self.model.bos_token_id).to(
+            self.model.device
+        )
+
+        prompt_len = text_x.shape[1]
+        graph_vars = self.graph_vars[prompt_len]
+        for c in graph_vars["cache"]:
+            c.reset_keys_and_values()
+
+        for offset in tqdm(range(max_steps)):
+            audio_input = torch.tile(audio_seq[:, offset : offset + 1], [2, 1, 1])
+            graph_vars["audio_x"].copy_(audio_input)
+            graph_vars["text_x"].copy_(text_x)
+            graph = self.graphs[prompt_len]
+            graph.replay()
+            audio_logits = graph_vars["output"]
+            cond_logits, uncond_logits = audio_logits[:1], audio_logits[1:2]
+            audio_logits = uncond_logits + (cond_logits - uncond_logits) * guidance_coef
+            audio_tokens = self.model.top_k_sampling(
+                logits=audio_logits, top_k=top_k, temperature=temperature, dim=-2
+            )
+            # "delay" pattern
+            audio_tokens[..., offset + 1 :] = self.model.bos_token_id
+            audio_tokens[..., : -max_steps + offset] = self.model.bos_token_id
+            audio_seq[:, offset + 1 : offset + 2] = audio_tokens
+
+        # Undo delay
+        for i in range(self.model.num_codebooks):
+            audio_seq[:, : -self.model.num_codebooks, i] = audio_seq[
+                :, i : -self.model.num_codebooks + i, i
+            ]
+
+        audio_seq = audio_seq[:, 1 : -self.model.num_codebooks + 1]
+        audio_seq = torch.swapaxes(audio_seq, -1, -2)[:, torch.newaxis]
+        # (2, 1, 2048, 4)
+        return audio_seq
+
+    @torch.inference_mode()
+    def generate(
+        self,
+        text_x: torch.Tensor,
+        max_steps: int = 150,
+        temperature: float = 1.0,
+        top_k: int = 250,
+        guidance_coef: float = 3.0,
+    ) -> torch.Tensor:
+        text_x = text_x.to(self.model.device).to(self.model.dtype)
+        text_x = self.model.text_proj(text_x)
+        # Assuming no audio prompt we start with all bos token for the codebooks
+        audio_shape = (1, max_steps + 1, self.model.num_codebooks)
+        audio_seq = torch.full(audio_shape, self.model.bos_token_id).to(
+            self.model.device
+        )
+
+        # Compute conditional and unconditional logits in one batch
+        text_tokens = torch.concatenate(
+            [text_x, torch.zeros_like(text_x).to(self.model.device)], dim=0
+        )
+        head_dim = self.model.hidden_size // self.model.num_attention_heads
+        cache = [
+            KVCache(head_dim, self.model.num_attention_heads, self.model.device)
+            for _ in range(len(self.model.layers))
+        ]
+        for offset in tqdm(range(max_steps)):
+            audio_input = torch.tile(audio_seq[:, offset : offset + 1], [2, 1, 1])
+            audio_logits = self.model(audio_input, text_tokens, cache)
+            cond_logits, uncond_logits = audio_logits[:1], audio_logits[1:2]
+            audio_logits = uncond_logits + (cond_logits - uncond_logits) * guidance_coef
+            audio_tokens = self.model.top_k_sampling(
+                logits=audio_logits, top_k=top_k, temperature=temperature, dim=-2
+            )
+            # "delay" pattern
+            audio_tokens[..., offset + 1 :] = self.model.bos_token_id
+            audio_tokens[..., : -max_steps + offset] = self.model.bos_token_id
+            audio_seq[:, offset + 1 : offset + 2] = audio_tokens
+
+        # Undo delay
+        for i in range(self.model.num_codebooks):
+            audio_seq[:, : -self.model.num_codebooks, i] = audio_seq[
+                :, i : -self.model.num_codebooks + i, i
+            ]
+
+        audio_seq = audio_seq[:, 1 : -self.model.num_codebooks + 1]
+        audio_seq = torch.swapaxes(audio_seq, -1, -2)[:, torch.newaxis]
+        return audio_seq
+
+
 class CausalLM(nn.Module):
     def __init__(
-        self, config: MusicgenConfig, device: str, dtype: torch.dtype = torch.float16
+        self,
+        config: MusicgenConfig,
+        device: str,
+        prompt_max_len: int = 20,
+        dtype: torch.dtype = torch.float16,
     ):
         super().__init__()
         self.config = config
@@ -19,6 +192,7 @@ class CausalLM(nn.Module):
         self.bos_token_id = config.decoder.bos_token_id
         self.hidden_size = config.decoder.hidden_size
         self.num_attention_heads = config.decoder.num_attention_heads
+        self.head_dim = self.hidden_size // self.num_attention_heads
 
         self.embed = nn.ModuleList(
             [
@@ -41,6 +215,10 @@ class CausalLM(nn.Module):
         )
         self.device = device
         self.dtype = dtype
+
+        self.prompt_max_len = prompt_max_len
+        self.graphs = {}
+        self.graph_vars = {}
 
     def forward(
         self,
@@ -69,65 +247,6 @@ class CausalLM(nn.Module):
         )
         return audio_x
 
-    @torch.inference_mode()
-    def generate(
-        self,
-        text_x: torch.Tensor,
-        max_steps: int = 150,
-        temperature: float = 1.0,
-        top_k: int = 250,
-        guidance_coef: float = 3.0,
-    ) -> torch.Tensor:
-        """generates a waveform conditioned on the text
-
-        Args:
-            text_x (torch.Tensor): (1, seq_len, hidden_size)
-            max_steps (int, optional): maximum number of steps to generate. Defaults to 150.
-            temperature (float, optional): temperature for sampling. Defaults to 1.0.
-            top_k (int, optional): top-k sampling. Defaults to 250.
-            guidance_coef (float, optional): guidance coefficient for guidance sampling. Defaults to 3.0.
-
-        Returns:
-            torch.Tensor: (1, max_steps, num_codebooks)
-        """
-        text_x = text_x.to(self.device).to(self.dtype)
-        text_x = self.text_proj(text_x)
-        # Assuming no audio prompt we start with all bos token for the codebooks
-        audio_shape = (1, max_steps + 1, self.num_codebooks)
-        audio_seq = torch.full(audio_shape, self.bos_token_id).to(self.device)
-
-        # Compute conditional and unconditional logits in one batch
-        text_tokens = torch.concatenate(
-            [text_x, torch.zeros_like(text_x).to(self.device)], dim=0
-        )
-        head_dim = self.hidden_size // self.num_attention_heads
-        cache = [
-            KVCache(head_dim, self.num_attention_heads, self.device)
-            for _ in range(len(self.layers))
-        ]
-        for offset in tqdm(range(max_steps)):
-            audio_input = torch.tile(audio_seq[:, offset : offset + 1], [2, 1, 1])
-            audio_logits = self(audio_input, text_tokens, cache)
-            cond_logits, uncond_logits = audio_logits[:1], audio_logits[1:2]
-            audio_logits = uncond_logits + (cond_logits - uncond_logits) * guidance_coef
-            audio_tokens = self.top_k_sampling(
-                logits=audio_logits, top_k=top_k, temperature=temperature, dim=-2
-            )
-            # "delay" pattern
-            audio_tokens[..., offset + 1 :] = self.bos_token_id
-            audio_tokens[..., : -max_steps + offset] = self.bos_token_id
-            audio_seq[:, offset + 1 : offset + 2] = audio_tokens
-
-        # Undo delay
-        for i in range(self.num_codebooks):
-            audio_seq[:, : -self.num_codebooks, i] = audio_seq[
-                :, i : -self.num_codebooks + i, i
-            ]
-
-        audio_seq = audio_seq[:, 1 : -self.num_codebooks + 1]
-        audio_seq = torch.swapaxes(audio_seq, -1, -2)[:, torch.newaxis]
-        return audio_seq
-
     def create_sin_embedding(
         self, positions: torch.Tensor, dim: int, max_period: float = 10000
     ) -> torch.Tensor:
@@ -135,9 +254,7 @@ class CausalLM(nn.Module):
         half_dim = dim // 2
         adim = torch.arange(half_dim).reshape(1, 1, -1)
         phase = positions / (max_period ** (adim / (half_dim - 1)))
-        return torch.concatenate([torch.cos(phase), torch.sin(phase)], dim=-1).to(
-            self.device
-        )
+        return torch.concatenate([torch.cos(phase), torch.sin(phase)], dim=-1)
 
     def top_k_sampling(
         self, logits: torch.Tensor, top_k: int, temperature: float, dim: int = -2
@@ -311,6 +428,11 @@ class KVCache:
         self.offset = 0
         self.step = num_steps
         self.device = device
+
+    def reset_keys_and_values(self):
+        self.keys.zero_()
+        self.values.zero_()
+        self.offset = 0
 
     def update_and_fetch(self, keys, values):
         prev = self.offset
