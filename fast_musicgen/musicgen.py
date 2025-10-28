@@ -14,13 +14,17 @@ class MusicGeneration:
         cuda_graph: bool = True,
         device: str = "cuda",
         dtype: torch.dtype = torch.float16,
+        prompt_max_len: int = 20,
     ) -> None:
         self.cuda_graph = cuda_graph
         self.text_encoder: TextEncoder = TextEncoder(
             t5_name=text_encoder_dir, device=device
         )
         self.lm: LMRunner = LMRunner(
-            checkpoint_dir=lm_dir, cuda_graph=cuda_graph, device=device
+            checkpoint_dir=lm_dir,
+            cuda_graph=cuda_graph,
+            device=device,
+            prompt_max_len=prompt_max_len,
         )
         self.audio_decoder: EncodecModel = EncodecModel.from_pretrained(
             audio_decoder_dir
@@ -29,8 +33,8 @@ class MusicGeneration:
     @torch.inference_mode()
     def generate(
         self,
-        text: str,
-        max_steps: int = 100,
+        text: str = "60s happy rock",
+        max_steps: int = 500,
         temperature: float = 1.0,
         top_k: int = 50,
         guidance_coef: float = 3,
@@ -59,3 +63,7 @@ class MusicGeneration:
             .numpy()
         )
         return audio.squeeze().squeeze()
+
+    @property
+    def sample_rate(self) -> int:
+        return self.audio_decoder.config.sampling_rate

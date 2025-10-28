@@ -11,67 +11,92 @@ from tqdm import tqdm
 class LMRunner:
     def __init__(
         self,
-        checkpoint_dir: str,
+        checkpoint_dir: str = "checkpoints/facebook/musicgen-medium",
         prompt_max_len: int = 20,
+        max_length: int = 1500,
         cuda_graph: bool = True,
         device: str = "cuda",
         dtype: torch.dtype = torch.float16,
     ) -> None:
+        """
+        Args:
+            checkpoint_dir (str, optional): The directory containing the checkpoint. Defaults to "checkpoints/facebook/musicgen-medium".
+            prompt_max_len (int, optional): The maximum length of the prompt. Defaults to 20.
+            max_length (int, optional): The maximum length of the cache. Defaults to 1500.
+            cuda_graph (bool, optional): Whether to use CUDA graph. Defaults to True.
+            device (str, optional): The device to use. Defaults to "cuda".
+            dtype (torch.dtype, optional): The data type to use. Defaults to torch.float16.
+        """
         super().__init__()
         torch.set_default_device(device)
         self.model = CausalLM.from_pretrained(checkpoint_dir, device=device)
+        self.model.set_cache(max_length=max_length)
         self.cuda_graph = cuda_graph
         self.prompt_max_len = prompt_max_len
+        self.max_length = max_length
         self.warmup()
         self.graphs = {}
         self.graph_vars = {}
+        self.graph_pool = None
         if self.cuda_graph:
             self.capture_cuda_graph()
 
     @torch.inference_mode()
     def capture_cuda_graph(self):
-        for i in range(1, self.prompt_max_len + 1):
+        for i in tqdm(range(1, self.prompt_max_len + 1)):
             text_x = torch.zeros(
-                2, i, self.model.config.decoder.hidden_size, dtype=self.model.dtype
+                2,
+                i,
+                self.model.config.decoder.hidden_size,
+                dtype=self.model.dtype,
+                device=self.model.device,
             )
-            audio_x = torch.full((2, 1, 4), self.model.config.decoder.bos_token_id)
-            cache = [
-                KVCache(
-                    self.model.head_dim,
-                    self.model.num_attention_heads,
-                    self.model.device,
-                )
-                for _ in range(len(self.model.layers))
-            ]
+            audio_x = torch.full(
+                (2, 1, 4),
+                self.model.config.decoder.bos_token_id,
+                dtype=torch.long,
+                device=self.model.device,
+            )
+            input_pos = torch.zeros(1, dtype=torch.long, device=self.model.device)
+            mask = torch.zeros(
+                1, self.max_length, dtype=torch.bool, device=self.model.device
+            )
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
-                output = self.model(audio_x, text_x, cache)
+                output = self.model(audio_x, text_x, input_pos, mask)
             self.graphs[i] = graph
             self.graph_vars[i] = {
                 "text_x": text_x,
                 "audio_x": audio_x,
-                "cache": cache,
+                "input_pos": input_pos,
+                "mask": mask,
                 "output": output,
             }
 
     @torch.inference_mode()
     def warmup(self):
-        for i in range(self.model.prompt_max_len):
+        for i in tqdm(range(10)):
             text_x = torch.randn(
-                2, i, self.model.config.decoder.hidden_size, dtype=self.model.dtype
+                2,
+                i,
+                self.model.config.decoder.hidden_size,
+                dtype=self.model.dtype,
+                device=self.model.device,
             )
             audio_x = torch.full(
-                (2, 1, 4), self.model.config.decoder.bos_token_id, dtype=torch.long
+                (2, 1, 4),
+                self.model.config.decoder.bos_token_id,
+                dtype=torch.long,
+                device=self.model.device,
             )
-            cache = [
-                KVCache(
-                    self.model.head_dim,
-                    self.model.num_attention_heads,
-                    self.model.device,
-                )
-                for _ in range(len(self.model.layers))
-            ]
-            _ = self.model(audio_x, text_x, cache)
+            input_pos = torch.tensor([i], dtype=torch.long, device=self.model.device)
+            mask = torch.zeros(
+                1, self.max_length, dtype=torch.bool, device=self.model.device
+            )
+            mask.index_fill_(1, input_pos, True)
+            _ = self.model(audio_x, text_x, input_pos, mask)
+        self.model.reset_cache()
+        torch.cuda.synchronize()
 
     @torch.inference_mode()
     def generate_with_cuda_graph(
@@ -96,13 +121,14 @@ class LMRunner:
 
         prompt_len = text_x.shape[1]
         graph_vars = self.graph_vars[prompt_len]
-        for c in graph_vars["cache"]:
-            c.reset_keys_and_values()
-
         for offset in tqdm(range(max_steps)):
             audio_input = torch.tile(audio_seq[:, offset : offset + 1], [2, 1, 1])
+            assert graph_vars["audio_x"].dtype == audio_input.dtype
+            assert graph_vars["text_x"].dtype == text_x.dtype
             graph_vars["audio_x"].copy_(audio_input)
             graph_vars["text_x"].copy_(text_x)
+            graph_vars["input_pos"].fill_(offset)
+            graph_vars["mask"].index_fill_(1, graph_vars["input_pos"], True)
             graph = self.graphs[prompt_len]
             graph.replay()
             audio_logits = graph_vars["output"]
@@ -115,7 +141,7 @@ class LMRunner:
             audio_tokens[..., offset + 1 :] = self.model.bos_token_id
             audio_tokens[..., : -max_steps + offset] = self.model.bos_token_id
             audio_seq[:, offset + 1 : offset + 2] = audio_tokens
-
+        graph_vars["mask"].zero_()
         # Undo delay
         for i in range(self.model.num_codebooks):
             audio_seq[:, : -self.model.num_codebooks, i] = audio_seq[
@@ -148,14 +174,15 @@ class LMRunner:
         text_tokens = torch.concatenate(
             [text_x, torch.zeros_like(text_x).to(self.model.device)], dim=0
         )
-        head_dim = self.model.hidden_size // self.model.num_attention_heads
-        cache = [
-            KVCache(head_dim, self.model.num_attention_heads, self.model.device)
-            for _ in range(len(self.model.layers))
-        ]
+        input_pos = torch.zeros(1, dtype=torch.long, device=self.model.device)
+        mask = torch.zeros(
+            1, self.max_length, dtype=torch.bool, device=self.model.device
+        )
         for offset in tqdm(range(max_steps)):
             audio_input = torch.tile(audio_seq[:, offset : offset + 1], [2, 1, 1])
-            audio_logits = self.model(audio_input, text_tokens, cache)
+            input_pos.fill_(offset)
+            mask.index_fill_(1, input_pos, True)
+            audio_logits = self.model(audio_input, text_tokens, input_pos, mask)
             cond_logits, uncond_logits = audio_logits[:1], audio_logits[1:2]
             audio_logits = uncond_logits + (cond_logits - uncond_logits) * guidance_coef
             audio_tokens = self.model.top_k_sampling(
@@ -216,36 +243,43 @@ class CausalLM(nn.Module):
         self.device = device
         self.dtype = dtype
 
-        self.prompt_max_len = prompt_max_len
-        self.graphs = {}
-        self.graph_vars = {}
-
     def forward(
         self,
         audio_x: torch.Tensor,
         text_x: torch.Tensor,
-        cache: Optional[KVCache] = None,
+        input_pos: torch.Tensor,
+        mask: torch.Tensor,
     ) -> torch.Tensor:
         """
         audio_x: (2, 1, num_codebooks)
         text_x: (2, seq_len, hidden_size)
+        input_pos: (1,)
+        mask: (1, max_length)
         """
-        if cache is None:
-            cache = [None] * len(self.layers)
         audio_x = sum(
             [self.embed[k](audio_x[..., k]) for k in range(self.num_codebooks)]
         )
-        offset = cache[0].offset if cache[0] is not None else 0
-        pos_emb = self.create_sin_embedding(offset, self.hidden_size)
+        pos_emb = self.create_sin_embedding(input_pos, self.hidden_size)
         audio_x += pos_emb.to(audio_x.dtype)
-        for layer, cache in zip(self.layers, cache):
-            audio_x = layer(audio_x=audio_x, text_x=text_x, cache=cache)
-
+        for layer in self.layers:
+            audio_x = layer(
+                audio_x=audio_x, text_x=text_x, input_pos=input_pos, mask=mask
+            )
         audio_x = self.out_norm(audio_x)
         audio_x = torch.stack(
             [self.heads[k](audio_x) for k in range(self.num_codebooks)], dim=-1
         )
         return audio_x
+
+    def set_cache(self, max_length: int = 1500):
+        for layer in self.layers:
+            layer.self_attn.set_cache(
+                max_length=max_length, device=self.device, dtype=self.dtype
+            )
+
+    def reset_cache(self):
+        for layer in self.layers:
+            layer.self_attn.reset_cache()
 
     def create_sin_embedding(
         self, positions: torch.Tensor, dim: int, max_period: float = 10000
@@ -333,21 +367,38 @@ class TransformerBlock(nn.Module):
         self,
         audio_x: torch.Tensor,
         text_x: torch.Tensor,
-        mask: Optional[torch.Tensor] = None,
-        cache: Optional[KVCache] = None,
+        input_pos: torch.Tensor,
+        mask: torch.Tensor,
     ) -> torch.Tensor:
         # self-attention and residual connection
         audio_xn = self.self_attn_norm(audio_x)
-        audio_x += self.self_attn(audio_xn, audio_xn, audio_xn, mask, cache)
+        audio_x += self.self_attn(
+            audio_xn, audio_xn, audio_xn, input_pos=input_pos, mask=mask
+        )
 
         # cross-attention and residual connection
         audio_xn = self.cross_attn_norm(audio_x)
-        audio_x += self.cross_attn(audio_xn, text_x, text_x, mask)
+        audio_x += self.cross_attn(audio_xn, text_x, text_x)
 
         # feed-forward and residual connection
         audio_xn = self.ffn_norm(audio_x)
         audio_x += self.ffn(audio_xn)
         return audio_x
+
+
+class FeedForward(nn.Module):
+    def __init__(self, config: MusicgenConfig):
+        super().__init__()
+        self.up_proj = nn.Linear(
+            config.decoder.hidden_size, config.decoder.ffn_dim, bias=False
+        )
+        self.down_proj = nn.Linear(
+            config.decoder.ffn_dim, config.decoder.hidden_size, bias=False
+        )
+        self.act = nn.GELU()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.down_proj(self.act(self.up_proj(x)))
 
 
 class MultiHeadAttention(nn.Module):
@@ -368,14 +419,15 @@ class MultiHeadAttention(nn.Module):
         self.num_heads = config.decoder.num_attention_heads
         self.head_dim = config.decoder.hidden_size // config.decoder.num_attention_heads
         self.scale = self.head_dim**-0.5
+        self.cache: Optional[KVCache] = None
 
     def forward(
         self,
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
+        input_pos: Optional[torch.Tensor] = None,
         mask: Optional[torch.Tensor] = None,
-        cache: Optional[KVCache] = None,
     ) -> torch.Tensor:
         B, L_q, D = q.shape
         L_k = k.shape[1]
@@ -387,8 +439,9 @@ class MultiHeadAttention(nn.Module):
         v = self.v_proj(v)
         v = v.reshape(B, L_k, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
 
-        if cache is not None:
-            k, v = cache.update_and_fetch(k, v)
+        if self.cache is not None:
+            assert input_pos is not None
+            k, v = self.cache(k, v, input_pos)
 
         o = nn.functional.scaled_dot_product_attention(
             query=q, key=k, value=v, attn_mask=mask, scale=self.scale
@@ -397,24 +450,33 @@ class MultiHeadAttention(nn.Module):
         o = self.out_proj(o)
         return o
 
-
-class FeedForward(nn.Module):
-    def __init__(self, config: MusicgenConfig):
-        super().__init__()
-        self.up_proj = nn.Linear(
-            config.decoder.hidden_size, config.decoder.ffn_dim, bias=False
+    def set_cache(
+        self,
+        max_length: int = 1500,
+        device: str = "cuda",
+        dtype: torch.dtype = torch.float16,
+    ):
+        self.cache = KVCache(
+            head_dim=self.head_dim,
+            n_kv_heads=self.num_heads,
+            device=device,
+            dtype=dtype,
+            max_length=max_length,
         )
-        self.down_proj = nn.Linear(
-            config.decoder.ffn_dim, config.decoder.hidden_size, bias=False
-        )
-        self.act = nn.GELU()
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.down_proj(self.act(self.up_proj(x)))
+    def reset_cache(self):
+        self.cache.reset_keys_and_values()
 
 
-class KVCache:
-    def __init__(self, head_dim, n_kv_heads, device: str, num_steps: int = 256):
+class KVCache(nn.Module):
+    def __init__(
+        self,
+        head_dim: int,
+        n_kv_heads: int,
+        device: str,
+        dtype: torch.dtype = torch.float16,
+        max_length: int = 1500,
+    ):
         super().__init__()
         self.n_kv_heads = n_kv_heads
         if isinstance(head_dim, int):
@@ -423,36 +485,36 @@ class KVCache:
             self.k_head_dim, self.v_head_dim = head_dim
         else:
             raise ValueError("head_dim must be an int or a tuple of two ints")
-        self.keys = None
-        self.values = None
-        self.offset = 0
-        self.step = num_steps
         self.device = device
+        self.max_length = max_length
+        k_shape = (2, self.n_kv_heads, self.max_length, self.k_head_dim)
+        v_shape = (2, self.n_kv_heads, self.max_length, self.v_head_dim)
+        self.register_buffer(
+            "keys",
+            torch.zeros(k_shape, dtype=dtype, device=self.device),
+            persistent=False,
+        )
+        self.register_buffer(
+            "values",
+            torch.zeros(v_shape, dtype=dtype, device=self.device),
+            persistent=False,
+        )
 
     def reset_keys_and_values(self):
-        self.keys.zero_()
-        self.values.zero_()
-        self.offset = 0
+        self.keys.fill_(0)
+        self.values.fill_(0)
 
-    def update_and_fetch(self, keys, values):
-        prev = self.offset
-        if self.keys is None or (prev + keys.shape[2]) > self.keys.shape[2]:
-            B = keys.shape[0]
-            n_steps = (self.step + keys.shape[2] - 1) // self.step
-            k_shape = (B, self.n_kv_heads, n_steps * self.step, self.k_head_dim)
-            v_shape = (B, self.n_kv_heads, n_steps * self.step, self.v_head_dim)
-            new_k = torch.zeros(k_shape, dtype=keys.dtype, device=self.device)
-            new_v = torch.zeros(v_shape, dtype=values.dtype, device=self.device)
-            if self.keys is not None:
-                if prev % self.step != 0:
-                    self.keys = self.keys[..., :prev, :]
-                    self.values = self.values[..., :prev, :]
-                self.keys = torch.concatenate([self.keys, new_k], dim=2)
-                self.values = torch.concatenate([self.values, new_v], dim=2)
-            else:
-                self.keys, self.values = new_k, new_v
-
-        self.offset += keys.shape[2]
-        self.keys[..., prev : self.offset, :] = keys
-        self.values[..., prev : self.offset, :] = values
-        return self.keys[..., : self.offset, :], self.values[..., : self.offset, :]
+    def forward(
+        self, keys: torch.Tensor, values: torch.Tensor, input_pos: torch.Tensor
+    ):
+        """
+        keys: (2, n_kv_heads, 1, k_head_dim)
+        values: (2, n_kv_heads, 1, v_head_dim)
+        input_pos: (1,)
+        """
+        assert keys.shape[2] == 1
+        assert values.shape[2] == 1
+        assert input_pos.shape[0] == 1
+        self.keys[..., input_pos, :] = keys
+        self.values[..., input_pos, :] = values
+        return self.keys, self.values

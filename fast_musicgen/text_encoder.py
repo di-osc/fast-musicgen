@@ -243,7 +243,9 @@ class TransformerEncoder(nn.Module):
         self.relative_attention_bias = RelativePositionBias(config, bidirectional=True)
 
     def forward(self, x: torch.Tensor):
-        pos_bias = self.relative_attention_bias(x.shape[1], x.shape[1])
+        # x: (batch_size, seq_len, d_model)
+        seq_len = x.shape[1]
+        pos_bias = self.relative_attention_bias(seq_len, seq_len)
         for layer in self.layers:
             x = layer(x, mask=pos_bias)
         return self.ln(x)
@@ -421,7 +423,7 @@ class T5(nn.Module):
 
     @classmethod
     def from_pretrained(
-        cls, path_or_repo: str, dtype: torch.dtype = torch.bfloat16
+        cls, path_or_repo: str, dtype: torch.dtype = torch.float16
     ) -> tuple["T5", Tokenizer]:
         from huggingface_hub import snapshot_download
 
