@@ -33,13 +33,13 @@ class MusicGeneration:
     @torch.inference_mode()
     def generate(
         self,
-        text: str = "60s happy rock",
+        prompt: str = "60s happy rock",
         max_steps: int = 500,
         temperature: float = 1.0,
         top_k: int = 50,
         guidance_coef: float = 3,
     ) -> torch.Tensor:
-        text_x = self.text_encoder.encode(text)
+        text_x = self.text_encoder.encode(prompt)
         if self.cuda_graph:
             audio_codes = self.lm.generate_with_cuda_graph(
                 text_x=text_x,
