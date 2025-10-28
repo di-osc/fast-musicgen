@@ -432,7 +432,7 @@ class T5(nn.Module):
             path = Path(
                 snapshot_download(
                     repo_id=path_or_repo,
-                    allow_patterns=["*.json", "*.safetensors", "pytorch_model.bin"],
+                    allow_patterns=["*.json", "pytorch_model.bin"],
                 )
             )
 
