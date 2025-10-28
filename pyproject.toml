@@ -8,7 +8,8 @@ dependencies = [
     "transformers>=4.57.1",
     "accelerate>=1.11.0",
     "tqdm",
-    "loguru"
+    "loguru",
+    "numpy"
 ]
 
 [[tool.uv.index]]
