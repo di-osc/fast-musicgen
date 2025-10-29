@@ -37,7 +37,6 @@ class LMRunner:
         self.warmup()
         self.graphs = {}
         self.graph_vars = {}
-        self.graph_pool = None
         if self.cuda_graph:
             self.capture_cuda_graph()
 
