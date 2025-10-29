@@ -28,7 +28,7 @@ class MusicGeneration:
             cuda_graph=cuda_graph,
             device=device,
             prompt_max_len=prompt_max_len,
-            max_length=int(self.max_duration_s) * 50, # 50 tokens per second
+            max_length=int(self.max_duration_s) * 50,  # 50 tokens per second
         )
         self.audio_decoder: EncodecModel = EncodecModel.from_pretrained(
             audio_decoder_dir
@@ -44,7 +44,7 @@ class MusicGeneration:
         guidance_coef: float = 3,
     ) -> torch.Tensor:
         duration_s = min(duration_s, self.max_duration_s)
-        max_steps = int(duration_s) * 50 # 50 tokens per second
+        max_steps = int(duration_s) * 50  # 50 tokens per second
         text_x = self.text_encoder.encode(prompt)
         text_len = text_x.shape[1]
         if self.cuda_graph and text_len <= self.lm.prompt_max_len:

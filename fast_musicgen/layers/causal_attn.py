@@ -1,7 +1,9 @@
+from typing import Optional
+
 import torch.nn as nn
 import torch
 from transformers import MusicgenConfig
-from typing import Optional
+from flash_attn import flash_attn_with_kvcache
 
 
 class CausalAttention(nn.Module):
@@ -29,27 +31,31 @@ class CausalAttention(nn.Module):
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        input_pos: Optional[torch.Tensor] = None,
-        mask: Optional[torch.Tensor] = None,
+        input_pos: torch.Tensor,
+        cache_seqlens: torch.Tensor,
     ) -> torch.Tensor:
+        """
+        q: (B, L_q, D)
+        k: (B, L_k, D)
+        v: (B, L_k, D)
+        input_pos: (1,)
+        cache_seqlens: (2,)
+        """
         B, L_q, D = q.shape
         L_k = k.shape[1]
-
         q = self.q_proj(q)
-        q = q.reshape(B, L_q, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        q = q.reshape(B, L_q, self.num_heads, self.head_dim)
         k = self.k_proj(k)
-        k = k.reshape(B, L_k, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        k = k.reshape(B, L_k, self.num_heads, self.head_dim)
         v = self.v_proj(v)
-        v = v.reshape(B, L_k, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        v = v.reshape(B, L_k, self.num_heads, self.head_dim)
 
-        if self.cache is not None:
-            assert input_pos is not None
-            k, v = self.cache(k, v, input_pos)
+        k, v = self.cache(k, v, input_pos)
 
-        o = nn.functional.scaled_dot_product_attention(
-            query=q, key=k, value=v, attn_mask=mask, scale=self.scale
+        o = flash_attn_with_kvcache(
+            q, k, v, causal=True, cache_seqlens=cache_seqlens, softmax_scale=self.scale
         )
-        o = o.permute(0, 2, 1, 3).reshape(B, L_q, D)
+        o = o.reshape(B, L_q, D)
         o = self.out_proj(o)
         return o
 
@@ -84,8 +90,8 @@ class KVCache(nn.Module):
         self.n_kv_heads = n_kv_heads
         self.device = device
         self.max_length = max_length
-        k_shape = (2, self.n_kv_heads, self.max_length, head_dim)
-        v_shape = (2, self.n_kv_heads, self.max_length, head_dim)
+        k_shape = (2, self.max_length, self.n_kv_heads, head_dim)
+        v_shape = (2, self.max_length, self.n_kv_heads, head_dim)
         self.register_buffer(
             "keys",
             torch.zeros(k_shape, dtype=dtype, device=self.device),
@@ -105,13 +111,13 @@ class KVCache(nn.Module):
         self, keys: torch.Tensor, values: torch.Tensor, input_pos: torch.Tensor
     ):
         """
-        keys: (2, n_kv_heads, 1, k_head_dim)
-        values: (2, n_kv_heads, 1, v_head_dim)
+        keys: (2, 1, n_kv_heads, k_head_dim)
+        values: (2, 1, n_kv_heads, v_head_dim)
         input_pos: (1,)
         """
-        assert keys.shape[2] == 1
-        assert values.shape[2] == 1
+        assert keys.shape[1] == 1
+        assert values.shape[1] == 1
         assert input_pos.shape[0] == 1
-        self.keys[..., input_pos, :] = keys
-        self.values[..., input_pos, :] = values
+        self.keys[:, input_pos, ...] = keys
+        self.values[:, input_pos, ...] = values
         return self.keys, self.values

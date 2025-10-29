@@ -61,18 +61,16 @@ class LMRunner:
                 device=self.model.device,
             )
             input_pos = torch.zeros(1, dtype=torch.long, device=self.model.device)
-            mask = torch.zeros(
-                1, self.max_length, dtype=torch.bool, device=self.model.device
-            )
+            cache_seqlens = torch.zeros(2, dtype=torch.int32, device=self.model.device)
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
-                output = self.model(audio_x, text_x, input_pos, mask)
+                output = self.model(audio_x, text_x, input_pos, cache_seqlens)
             self.graphs[i] = graph
             self.graph_vars[i] = {
                 "text_x": text_x,
                 "audio_x": audio_x,
                 "input_pos": input_pos,
-                "mask": mask,
+                "cache_seqlens": cache_seqlens,
                 "output": output,
             }
 
@@ -93,11 +91,8 @@ class LMRunner:
                 device=self.model.device,
             )
             input_pos = torch.tensor([i], dtype=torch.long, device=self.model.device)
-            mask = torch.zeros(
-                1, self.max_length, dtype=torch.bool, device=self.model.device
-            )
-            mask.index_fill_(1, input_pos, True)
-            _ = self.model(audio_x, text_x, input_pos, mask)
+            cache_seqlens = torch.zeros(2, dtype=torch.int32, device=self.model.device)
+            _ = self.model(audio_x, text_x, input_pos, cache_seqlens)
         self.model.reset_cache()
         torch.cuda.synchronize()
 
@@ -131,7 +126,7 @@ class LMRunner:
             graph_vars["audio_x"].copy_(audio_input)
             graph_vars["text_x"].copy_(text_x)
             graph_vars["input_pos"].fill_(offset)
-            graph_vars["mask"].index_fill_(1, graph_vars["input_pos"], True)
+            graph_vars["cache_seqlens"].fill_(offset + 1)
             graph = self.graphs[prompt_len]
             graph.replay()
             audio_logits = graph_vars["output"]
@@ -144,7 +139,6 @@ class LMRunner:
             audio_tokens[..., offset + 1 :] = self.model.bos_token_id
             audio_tokens[..., : -max_steps + offset] = self.model.bos_token_id
             audio_seq[:, offset + 1 : offset + 2] = audio_tokens
-        graph_vars["mask"].zero_()
         # Undo delay
         for i in range(self.model.num_codebooks):
             audio_seq[:, : -self.model.num_codebooks, i] = audio_seq[
@@ -178,14 +172,14 @@ class LMRunner:
             [text_x, torch.zeros_like(text_x).to(self.model.device)], dim=0
         )
         input_pos = torch.zeros(1, dtype=torch.long, device=self.model.device)
-        mask = torch.zeros(
-            1, self.max_length, dtype=torch.bool, device=self.model.device
-        )
+        cache_seqlens = torch.zeros(2, dtype=torch.int32, device=self.model.device)
         for offset in tqdm(range(max_steps)):
             audio_input = torch.tile(audio_seq[:, offset : offset + 1], [2, 1, 1])
             input_pos.fill_(offset)
-            mask.index_fill_(1, input_pos, True)
-            audio_logits = self.model(audio_input, text_tokens, input_pos, mask)
+            cache_seqlens.fill_(offset + 1)
+            audio_logits = self.model(
+                audio_input, text_tokens, input_pos, cache_seqlens
+            )
             cond_logits, uncond_logits = audio_logits[:1], audio_logits[1:2]
             audio_logits = uncond_logits + (cond_logits - uncond_logits) * guidance_coef
             audio_tokens = self.model.top_k_sampling(
@@ -251,13 +245,13 @@ class CausalLM(nn.Module):
         audio_x: torch.Tensor,
         text_x: torch.Tensor,
         input_pos: torch.Tensor,
-        mask: torch.Tensor,
+        cache_seqlens: torch.Tensor,
     ) -> torch.Tensor:
         """
         audio_x: (2, 1, num_codebooks)
         text_x: (2, seq_len, hidden_size)
         input_pos: (1,)
-        mask: (1, max_length)
+        cache_seqlens: (2,)
         """
         audio_x = sum(
             [self.embed[k](audio_x[..., k]) for k in range(self.num_codebooks)]
@@ -266,7 +260,10 @@ class CausalLM(nn.Module):
         audio_x += pos_emb.to(audio_x.dtype)
         for layer in self.layers:
             audio_x = layer(
-                audio_x=audio_x, text_x=text_x, input_pos=input_pos, mask=mask
+                audio_x=audio_x,
+                text_x=text_x,
+                input_pos=input_pos,
+                cache_seqlens=cache_seqlens,
             )
         audio_x = self.out_norm(audio_x)
         audio_x = torch.stack(
@@ -371,12 +368,16 @@ class TransformerBlock(nn.Module):
         audio_x: torch.Tensor,
         text_x: torch.Tensor,
         input_pos: torch.Tensor,
-        mask: torch.Tensor,
+        cache_seqlens: torch.Tensor,
     ) -> torch.Tensor:
         # self-attention and residual connection
         audio_xn = self.self_attn_norm(audio_x)
         audio_x += self.self_attn(
-            audio_xn, audio_xn, audio_xn, input_pos=input_pos, mask=mask
+            audio_xn,
+            audio_xn,
+            audio_xn,
+            input_pos=input_pos,
+            cache_seqlens=cache_seqlens,
         )
 
         # cross-attention and residual connection
