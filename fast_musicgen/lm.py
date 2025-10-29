@@ -479,16 +479,10 @@ class KVCache(nn.Module):
     ):
         super().__init__()
         self.n_kv_heads = n_kv_heads
-        if isinstance(head_dim, int):
-            self.k_head_dim = self.v_head_dim = head_dim
-        elif isinstance(head_dim, tuple) and len(head_dim) == 2:
-            self.k_head_dim, self.v_head_dim = head_dim
-        else:
-            raise ValueError("head_dim must be an int or a tuple of two ints")
         self.device = device
         self.max_length = max_length
-        k_shape = (2, self.n_kv_heads, self.max_length, self.k_head_dim)
-        v_shape = (2, self.n_kv_heads, self.max_length, self.v_head_dim)
+        k_shape = (2, self.n_kv_heads, self.max_length, head_dim)
+        v_shape = (2, self.n_kv_heads, self.max_length, head_dim)
         self.register_buffer(
             "keys",
             torch.zeros(k_shape, dtype=dtype, device=self.device),
