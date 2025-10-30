@@ -28,6 +28,13 @@ High-performance music generation engine based on Meta MusicGen, featuring **3x 
    # https://github.com/Dao-AILab/flash-attention/releases
    pip install flash-attn --no-build-isolation
    ```
+3. **Download the checkpoints**
+   ```bash
+   pip install huggingface_hub
+   hf download facebook/musicgen-medium --local-dir checkpoints/facebook/musicgen-medium
+   hf download facebook/encodec_32khz --local-dir checkpoints/facebook/encodec_32khz
+   hf download t5-base --local-dir checkpoints/t5-base
+   ```
 
 ### Install Fast MusicGen
 
@@ -51,19 +58,11 @@ audio = model.generate("happy rock", duration_s=10)
 torchaudio.save("music.wav", audio.cpu(), model.sample_rate)
 ```
 
-## 🎯 Architecture
-
-```
-Text Input → Text Encoder → Language Model → Audio Decoder → Audio Output
-                   ↑              ↑
-             Flash Attention     CUDA Graph
-```
-
 ## 📊 Performance Comparison
 
-| Configuration | Original MusicGen | Fast MusicGen | Speedup |
-|---------------|-------------------|---------------|---------|
-| RTX 4090     | ~40 tokens/sec    | 100+ tokens/sec | **3x** |
+| Model | Configuration | Original MusicGen | Fast MusicGen | Speedup |
+|-------|---------------|-------------------|---------------|---------|
+|MusicGen-Medium| RTX 4090     | ~40 tokens/sec    | 130+ tokens/sec | **3x** |
 
 ---
 
