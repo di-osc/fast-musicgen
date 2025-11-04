@@ -63,6 +63,7 @@ torchaudio.save("music.wav", audio.cpu(), model.sample_rate)
 | Model | Configuration | Original MusicGen | Fast MusicGen | Speedup |
 |-------|---------------|-------------------|---------------|---------|
 |MusicGen-Medium| RTX 4090     | ~40 tokens/sec    | 130+ tokens/sec | **3x** |
+|MusicGen-Small| RTX 4090     | ~40 tokens/sec    | 400+ tokens/sec | **3x** |
 
 ---
 

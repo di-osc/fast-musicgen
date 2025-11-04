@@ -1,6 +1,9 @@
 from __future__ import annotations
-from typing import List, Dict
+from typing import List, Dict, Tuple
 from pathlib import Path
+from queue import Queue
+import time
+import threading
 
 import torch.nn as nn
 import torch
@@ -10,6 +13,7 @@ from tqdm import tqdm
 from .layers.ffn import FeedForward
 from .layers.cross_attn import CrossAttention
 from .layers.causal_attn import CausalAttention
+from .scheduler import AudioSequence, Scheduler
 
 
 class LMRunner:
@@ -18,6 +22,7 @@ class LMRunner:
         checkpoint_dir: str = "checkpoints/facebook/musicgen-medium",
         prompt_max_len: int = 20,
         max_length: int = 1500,
+        max_batch_size: int = 2,
         cuda_graph: bool = True,
         device: str = "cuda",
         dtype: torch.dtype = torch.float16,
@@ -27,17 +32,20 @@ class LMRunner:
             checkpoint_dir (str, optional): The directory containing the checkpoint. Defaults to "checkpoints/facebook/musicgen-medium".
             prompt_max_len (int, optional): The maximum length of the prompt. Defaults to 20.
             max_length (int, optional): The maximum length of the cache. Defaults to 1500.
+            max_batch_size (int, optional): The maximum batch size to use. Defaults to 4.
             cuda_graph (bool, optional): Whether to use CUDA graph. Defaults to True.
             device (str, optional): The device to use. Defaults to "cuda".
             dtype (torch.dtype, optional): The data type to use. Defaults to torch.float16.
         """
         super().__init__()
         torch.set_default_device(device)
+        self.scheduler = Scheduler(max_batch_size=max_batch_size)
         self.model = CausalLM.from_pretrained(checkpoint_dir, device=device)
-        self.model.set_cache(max_length=max_length)
+        self.model.set_cache(max_length=max_length, batch_size=max_batch_size)
         self.cuda_graph = cuda_graph
         self.prompt_max_len = prompt_max_len
         self.max_length = max_length
+        self.max_batch_size = max_batch_size
         self.warmup()
         self.graphs = {}
         self.graph_vars = {}
@@ -46,53 +54,70 @@ class LMRunner:
 
     @torch.inference_mode()
     def capture_cuda_graph(self):
-        for i in tqdm(range(1, self.prompt_max_len + 1)):
-            text_x = torch.zeros(
-                2,
-                i,
-                self.model.config.decoder.hidden_size,
-                dtype=self.model.dtype,
-                device=self.model.device,
-            )
-            audio_x = torch.full(
-                (2, 1, 4),
-                self.model.config.decoder.bos_token_id,
-                dtype=torch.long,
-                device=self.model.device,
-            )
-            input_pos = torch.zeros(1, dtype=torch.long, device=self.model.device)
-            cache_seqlens = torch.zeros(2, dtype=torch.int32, device=self.model.device)
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
-                output = self.model(audio_x, text_x, input_pos, cache_seqlens)
-            self.graphs[i] = graph
-            self.graph_vars[i] = {
-                "text_x": text_x,
-                "audio_x": audio_x,
-                "input_pos": input_pos,
-                "cache_seqlens": cache_seqlens,
-                "output": output,
-            }
+        for batch_size in range(1, self.max_batch_size + 1):
+            self.graph_vars[batch_size] = {}
+            self.graphs[batch_size] = {}
+            for i in tqdm(range(1, self.prompt_max_len + 1)):
+                text_x = torch.zeros(
+                    2 * batch_size,
+                    i,
+                    self.model.config.decoder.hidden_size,
+                    dtype=self.model.dtype,
+                    device=self.model.device,
+                )
+                audio_x = torch.full(
+                    (2 * batch_size, 1, 4),
+                    self.model.config.decoder.bos_token_id,
+                    dtype=torch.long,
+                    device=self.model.device,
+                )
+                input_pos = torch.zeros(
+                    2 * batch_size, dtype=torch.long, device=self.model.device
+                )
+                cache_seqlens = torch.zeros(
+                    2 * batch_size, dtype=torch.int32, device=self.model.device
+                )
+                cache_batch_idx = torch.zeros(
+                    2 * batch_size, dtype=torch.int32, device=self.model.device
+                )
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    output = self.model(
+                        audio_x, text_x, input_pos, cache_seqlens, cache_batch_idx
+                    )
+                self.graphs[batch_size][i] = graph
+                self.graph_vars[batch_size][i] = {
+                    "text_x": text_x,
+                    "audio_x": audio_x,
+                    "input_pos": input_pos,
+                    "cache_seqlens": cache_seqlens,
+                    "cache_batch_idx": cache_batch_idx,
+                    "output": output,
+                }
 
     @torch.inference_mode()
     def warmup(self):
-        for i in tqdm(range(10)):
-            text_x = torch.randn(
-                2,
-                i,
-                self.model.config.decoder.hidden_size,
-                dtype=self.model.dtype,
-                device=self.model.device,
-            )
-            audio_x = torch.full(
-                (2, 1, 4),
-                self.model.config.decoder.bos_token_id,
-                dtype=torch.long,
-                device=self.model.device,
-            )
-            input_pos = torch.tensor([i], dtype=torch.long, device=self.model.device)
-            cache_seqlens = torch.zeros(2, dtype=torch.int32, device=self.model.device)
-            _ = self.model(audio_x, text_x, input_pos, cache_seqlens)
+        for batch_size in range(1, self.max_batch_size + 1):
+            for i in tqdm(range(2)):
+                text_x = torch.randn(
+                    2 * batch_size,
+                    i,
+                    self.model.config.decoder.hidden_size,
+                    dtype=self.model.dtype,
+                    device=self.model.device,
+                )
+                audio_x = torch.full(
+                    (2 * batch_size, 1, 4),
+                    self.model.config.decoder.bos_token_id,
+                    dtype=torch.long,
+                    device=self.model.device,
+                )
+                input_pos = torch.tensor([i] * 2 * batch_size, dtype=torch.long, device=self.model.device)
+                cache_seqlens = torch.zeros(2 * batch_size, dtype=torch.int32, device=self.model.device)
+                cache_batch_idx = torch.zeros(
+                    2 * batch_size, dtype=torch.int32, device=self.model.device
+                )
+                _ = self.model(audio_x, text_x, input_pos, cache_seqlens, cache_batch_idx)
         self.model.reset_cache()
         torch.cuda.synchronize()
 
@@ -173,12 +198,15 @@ class LMRunner:
         )
         input_pos = torch.zeros(1, dtype=torch.long, device=self.model.device)
         cache_seqlens = torch.zeros(2, dtype=torch.int32, device=self.model.device)
+        cache_batch_idx = torch.tensor(
+            [0, 1], dtype=torch.int32, device=self.model.device
+        )
         for offset in tqdm(range(max_steps)):
             audio_input = torch.tile(audio_seq[:, offset : offset + 1], [2, 1, 1])
             input_pos.fill_(offset)
             cache_seqlens.fill_(offset + 1)
             audio_logits = self.model(
-                audio_input, text_tokens, input_pos, cache_seqlens
+                audio_input, text_tokens, input_pos, cache_seqlens, cache_batch_idx
             )
             cond_logits, uncond_logits = audio_logits[:1], audio_logits[1:2]
             audio_logits = uncond_logits + (cond_logits - uncond_logits) * guidance_coef
@@ -199,6 +227,50 @@ class LMRunner:
         audio_seq = audio_seq[:, 1 : -self.model.num_codebooks + 1]
         audio_seq = torch.swapaxes(audio_seq, -1, -2)[:, torch.newaxis]
         return audio_seq
+
+    def prepare(
+        self, seqs: List[AudioSequence]
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        for seq in seqs:
+            seq.text_x = self.model.text_proj(seq.text_x)
+            seq.text_tokens = torch.concatenate(
+                [seq.text_x, torch.zeros_like(seq.text_x).to(self.model.device)], dim=0
+            )
+            seq.input_pos = torch.zeros(1, dtype=torch.long, device=self.model.device)
+            seq.cache_seqlens = torch.zeros(
+                2, dtype=torch.int32, device=self.model.device
+            )
+            seq.cache_batch_idx = torch.tensor(
+                [0, 1], dtype=torch.int32, device=self.model.device
+            )
+
+    def run_step(self, seqs: List[AudioSequence]) -> List[AudioSequence]:
+        audio_input, text_tokens, input_pos, cache_seqlens, cache_batch_idx = (
+            self.prepare(seqs)
+        )
+        if self.cuda_graph:
+            cra
+
+    def generate(self, seqs: List[AudioSequence]) -> List[torch.Tensor]:
+        response_queue = Queue()
+        for seq in seqs:
+            self.scheduler.add(seq, response_queue)
+        results = []
+        while len(results) < len(seqs):
+            results.append(response_queue.get())
+        return results
+
+    def start_running(self) -> None:
+        threading.Thread(target=self._run_loop, daemon=True).start()
+
+    def _run_loop(self) -> None:
+        while True:
+            seqs = self.scheduler.schedule()
+            if len(seqs) == 0:
+                time.sleep(0.01)
+                continue
+            seqs = self.run_step(seqs)
+            self.scheduler.check_finished(seqs)
 
 
 class CausalLM(nn.Module):
@@ -246,12 +318,14 @@ class CausalLM(nn.Module):
         text_x: torch.Tensor,
         input_pos: torch.Tensor,
         cache_seqlens: torch.Tensor,
+        cache_batch_idx: torch.Tensor,
     ) -> torch.Tensor:
         """
         audio_x: (2, 1, num_codebooks)
         text_x: (2, seq_len, hidden_size)
         input_pos: (1,)
         cache_seqlens: (2,)
+        cache_batch_idx: (2,)
         """
         audio_x = sum(
             [self.embed[k](audio_x[..., k]) for k in range(self.num_codebooks)]
@@ -264,6 +338,7 @@ class CausalLM(nn.Module):
                 text_x=text_x,
                 input_pos=input_pos,
                 cache_seqlens=cache_seqlens,
+                cache_batch_idx=cache_batch_idx,
             )
         audio_x = self.out_norm(audio_x)
         audio_x = torch.stack(
@@ -271,10 +346,13 @@ class CausalLM(nn.Module):
         )
         return audio_x
 
-    def set_cache(self, max_length: int = 1500):
+    def set_cache(self, max_length: int = 1500, batch_size: int = 2):
         for layer in self.layers:
             layer.self_attn.set_cache(
-                max_length=max_length, device=self.device, dtype=self.dtype
+                max_length=max_length,
+                device=self.device,
+                dtype=self.dtype,
+                batch_size=batch_size * 2,
             )
 
     def reset_cache(self):
@@ -287,7 +365,7 @@ class CausalLM(nn.Module):
         assert dim % 2 == 0
         half_dim = dim // 2
         adim = torch.arange(half_dim).reshape(1, 1, -1)
-        phase = positions / (max_period ** (adim / (half_dim - 1)))
+        phase = positions[:, None, None] / (max_period ** (adim / (half_dim - 1)))
         return torch.concatenate([torch.cos(phase), torch.sin(phase)], dim=-1)
 
     def top_k_sampling(
@@ -369,6 +447,7 @@ class TransformerBlock(nn.Module):
         text_x: torch.Tensor,
         input_pos: torch.Tensor,
         cache_seqlens: torch.Tensor,
+        cache_batch_idx: torch.Tensor,
     ) -> torch.Tensor:
         # self-attention and residual connection
         audio_xn = self.self_attn_norm(audio_x)
@@ -378,6 +457,7 @@ class TransformerBlock(nn.Module):
             audio_xn,
             input_pos=input_pos,
             cache_seqlens=cache_seqlens,
+            cache_batch_idx=cache_batch_idx,
         )
 
         # cross-attention and residual connection

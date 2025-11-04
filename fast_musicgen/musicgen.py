@@ -1,6 +1,5 @@
 from transformers import EncodecModel
 import torch
-from loguru import logger
 
 from .text_encoder import TextEncoder
 from .lm import LMRunner
@@ -23,16 +22,17 @@ class MusicGeneration:
         self.text_encoder: TextEncoder = TextEncoder(
             t5_name=text_encoder_dir, device=device
         )
+        self.audio_decoder: EncodecModel = EncodecModel.from_pretrained(
+            audio_decoder_dir
+        ).to(device)
         self.lm: LMRunner = LMRunner(
             checkpoint_dir=lm_dir,
             cuda_graph=cuda_graph,
             device=device,
             prompt_max_len=prompt_max_len,
-            max_length=int(self.max_duration_s) * 50,  # 50 tokens per second
+            max_length=int(self.max_duration_s)
+            * self.frame_rate,  # 50 tokens per second
         )
-        self.audio_decoder: EncodecModel = EncodecModel.from_pretrained(
-            audio_decoder_dir
-        ).to(device)
 
     @torch.inference_mode()
     def generate(
@@ -74,3 +74,7 @@ class MusicGeneration:
     @property
     def sample_rate(self) -> int:
         return self.audio_decoder.config.sampling_rate
+
+    @property
+    def frame_rate(self) -> int:
+        return self.audio_decoder.config.frame_rate

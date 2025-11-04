@@ -33,6 +33,7 @@ class CausalAttention(nn.Module):
         v: torch.Tensor,
         input_pos: torch.Tensor,
         cache_seqlens: torch.Tensor,
+        cache_batch_idx: torch.Tensor,
     ) -> torch.Tensor:
         """
         q: (B, L_q, D)
@@ -40,6 +41,7 @@ class CausalAttention(nn.Module):
         v: (B, L_k, D)
         input_pos: (1,)
         cache_seqlens: (2,)
+        cache_batch_idx: (2,)
         """
         B, L_q, D = q.shape
         L_k = k.shape[1]
@@ -50,10 +52,16 @@ class CausalAttention(nn.Module):
         v = self.v_proj(v)
         v = v.reshape(B, L_k, self.num_heads, self.head_dim)
 
-        k, v = self.cache(k, v, input_pos)
+        k, v = self.cache(k, v, input_pos, cache_batch_idx)
 
         o = flash_attn_with_kvcache(
-            q, k, v, causal=True, cache_seqlens=cache_seqlens, softmax_scale=self.scale
+            q,
+            k,
+            v,
+            causal=True,
+            cache_seqlens=cache_seqlens,
+            softmax_scale=self.scale,
+            cache_batch_idx=cache_batch_idx,
         )
         o = o.reshape(B, L_q, D)
         o = self.out_proj(o)
@@ -62,6 +70,7 @@ class CausalAttention(nn.Module):
     def set_cache(
         self,
         max_length: int = 1500,
+        batch_size: int = 2,
         device: str = "cuda",
         dtype: torch.dtype = torch.float16,
     ):
@@ -71,6 +80,7 @@ class CausalAttention(nn.Module):
             device=device,
             dtype=dtype,
             max_length=max_length,
+            batch_size=batch_size,
         )
 
     def reset_cache(self):
@@ -80,6 +90,7 @@ class CausalAttention(nn.Module):
 class KVCache(nn.Module):
     def __init__(
         self,
+        batch_size: int,
         head_dim: int,
         n_kv_heads: int,
         device: str,
@@ -90,8 +101,8 @@ class KVCache(nn.Module):
         self.n_kv_heads = n_kv_heads
         self.device = device
         self.max_length = max_length
-        k_shape = (2, self.max_length, self.n_kv_heads, head_dim)
-        v_shape = (2, self.max_length, self.n_kv_heads, head_dim)
+        k_shape = (batch_size, self.max_length, self.n_kv_heads, head_dim)
+        v_shape = (batch_size, self.max_length, self.n_kv_heads, head_dim)
         self.register_buffer(
             "keys",
             torch.zeros(k_shape, dtype=dtype, device=self.device),
@@ -108,16 +119,21 @@ class KVCache(nn.Module):
         self.values.fill_(0)
 
     def forward(
-        self, keys: torch.Tensor, values: torch.Tensor, input_pos: torch.Tensor
+        self,
+        keys: torch.Tensor,
+        values: torch.Tensor,
+        input_pos: torch.Tensor,
+        cache_batch_idx: torch.Tensor,
     ):
         """
-        keys: (2, 1, n_kv_heads, k_head_dim)
-        values: (2, 1, n_kv_heads, v_head_dim)
-        input_pos: (1,)
+        keys: (batch_size, 1, n_kv_heads, k_head_dim)
+        values: (batch_size, 1, n_kv_heads, v_head_dim)
+        input_pos: (batch_size,)
+        cache_batch_idx: (batch_size,)
         """
-        assert keys.shape[1] == 1
-        assert values.shape[1] == 1
-        assert input_pos.shape[0] == 1
-        self.keys[:, input_pos, ...] = keys
-        self.values[:, input_pos, ...] = values
+        assert (
+            cache_batch_idx.shape[0] == keys.shape[0] == values.shape[0]
+        ), f"cache_batch_idx.shape: {cache_batch_idx.shape}, keys.shape: {keys.shape}, values.shape: {values.shape}"
+        self.keys[cache_batch_idx[..., None], input_pos[None, ...], ...] = keys
+        self.values[cache_batch_idx[..., None], input_pos[None, ...], ...] = values
         return self.keys, self.values
